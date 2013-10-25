@@ -1,0 +1,5 @@
+List of enhancements
+1)	Dynamic port allocation – we need a way to assign ports to users without hard coding them to specific user names.
+2)	Masking of the API key – We need to either wrap the curl request or reference the key from a file so it is not visible in ps when it is running.
+3)	Log off script- We need a clean up script. Probably need to determine what information we need to store locally from the startup process to properly clean up as well.
+4)	Need to wrap the iptables command so that the user does not have to be root.
