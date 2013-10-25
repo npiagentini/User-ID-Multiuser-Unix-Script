@@ -1,0 +1,215 @@
+#!/usr/bin/ruby
+# -*- coding: utf-8 -*-
+
+require 'time'
+require 'yaml'
+require 'rubygems'
+require 'ipaddress'
+require 'rest_client'
+require 'xmlsimple'
+require 'trollop'
+require 'systemu'
+
+# Assume no debugging, unless told otherwise.
+DEBUG=nil
+
+# Write an object as a YAML file (so it can be read back in later).
+def write_yaml(filename, object)
+  File.open(filename, 'w') do |io|
+    YAML::dump(object, io)
+  end
+end
+
+# Read in an object previously written to a YAML file.
+def read_yaml(filename, default={})
+  return default unless File.exists? filename
+  File.open(filename) do |io|
+    return YAML::load(io)
+  end
+end
+
+# Fetch the request from the firewall.
+def fwfetch(command, host, secret)
+  puts "-----\n#{command}\n-----" if DEBUG
+  if secret
+    url="https://" + host + "/api/?key=" + secret + "&" + URI.encode(command)
+  else
+    url="https://" + host + "/api/?" + URI.encode(command)
+  end
+
+  xmlresult=RestClient.get url
+
+  puts "#{url}\n-----\n#{xmlresult}\n-----" if DEBUG
+
+  return xmlresult
+end
+
+# Convert raw XML into a hash.
+def xml2hash(xml)
+  return XmlSimple.xml_in(xml, { 'KeyAttr' => 'name' })
+end
+
+
+
+# Do command line option parsing.
+opts = Trollop::options do
+  opt :noupdate, "Do not update config file"
+  opt :keygen, "Generate a key for use with this tool (requires --login and --passwd)"
+  opt :login, "Firewall login name", :type => :string
+  opt :passwd, "Firewall login password", :type => :string
+  opt :config, "Specifiy a config file (defaults to ./.pantool, then ~/.pantool)", :type => :string
+  opt :addr, "Firewall address (IP or DNS name)", :type => :string
+  opt :key, "secret key", :type => :string
+  opt :debug, "Show extra debug info (not useful for most users)"
+  opt :jump, "IP address (not hostname) of the jump server", :type => :string
+  opt :start, "Starting port for user source ports (default 30000)", :type => :string
+  opt :peruser, "Ports per user (default 100)", :type => :string
+end
+
+# The user wants debugging info.
+if opts[:debug_given]
+  DEBUG=true
+end
+
+# Find, load, and parse the config file (if there is one).
+config=Hash.new
+config_file=ENV["HOME"] + "/.pantool"
+if opts[:config_given]
+  if File.file? opts[:config]
+    config=read_yaml opts[:config]
+    config_file=opts[:config]
+  end
+else
+  if File.file?(".pantool")
+    config=read_yaml ".pantool"
+    config_file=".pantool"
+  elsif File.file?(ENV["HOME"] + "/.pantool")
+    config=read_yaml ENV["HOME"] + "/.pantool"
+    config_file=ENV["HOME"] + "/.pantool"
+  end
+end
+
+# Generate a key.
+if opts[:keygen_given]
+  if opts[:login_given]&&opts[:passwd_given]
+    cmd='type=keygen&user=' + opts[:login] + '&password=' + opts[:passwd]
+  else
+    puts "Must supply --login and --passwd when generating a key."
+    exit
+  end
+else
+  if opts[:login_given]||opts[:passwd_given]
+    puts "--login and -passwd serve no purpose without --keygen"
+  end
+end
+
+# Which device and key?
+fw=opts[:addr]
+key=opts[:key]
+
+# Make sure we have a key for the device.  Either the user should
+# supply one, or we can dig for it in our config file.  A command-line
+# supplied key wins over a config-file supplied key.
+if !key && !opts[:keygen_given]
+  if config.has_key? fw
+    key=config[fw]
+  else
+    puts "No valid key found/supplied for host #{fw}"
+    exit
+  end
+end
+
+# Make sure the user supplied a jump server.  Do some extremely
+# rudimentary checks to make sure it's an IP address, not a host name.
+if opts[:jump_given]
+  if IPAddress.valid? opts[:jump]
+    dest_ip=opts[:jump]
+  else
+    puts "No valid jump server supplied."
+    exit
+  end
+else
+  puts "No valid jump server supplied."
+  exit
+end
+
+# If the user supplied a start port, grab it.
+if opts[:start_given]
+  start_port=opts[:start].to_i
+else
+  start_port=30000
+end
+
+# If the user specified ports per user, use it.
+if opts[:peruser_given]
+  ports_per_user=opts[:peruser].to_i
+else
+  ports_per_user=100
+end
+
+# If the user wants to generate a key, make it so.
+if opts[:keygen_given]
+  xmlresult=fwfetch(cmd,fw,key)
+end
+
+# If the user tried to generate a key, give them feedback, and add the
+# key to the config file (assuming we weren't told not to).
+if opts[:keygen_given]
+  tmp=xml2hash(xmlresult)
+  if tmp["result"][0]["msg"]
+    puts tmp["result"][0]["msg"][0]
+  else
+    puts tmp["result"][0]["key"][0]
+    config[fw]=tmp["result"][0]["key"][0]
+    write_yaml(config_file,config) unless opts[:noupdates_given]
+  end
+end
+
+# First thing, get a list of valid users on this machine.  Since this
+# is proof-of-concept code, we're doing two things here that are valid
+# most of the time, but not universally.  First, we're assuming users
+# are defined locally and statically in /etc/passwd.  This covers
+# probably 99% of the use cases, but not 100%.  Second, we're assuming
+# that valid users have UIDs between 1000 and 10000.  Again, this
+# covers probably 99% of installations, but sure as hell not 100%.
+users=Hash.new
+user_port=start_port
+File.open('/etc/passwd') do |io|
+  io.each_line do |line|
+    name, passwd, uid, gid, uname, homedir, shell=line.split(':')
+    uid=uid.to_i
+    if uid >= 1000 and uid < 10000
+      users[name]=user_port
+      user_port=user_port+ports_per_user
+    end
+  end
+end
+
+# Ok, now run the iptables commands to limit the source ports per
+# user.
+users.each_key do |user|
+  puts "iptables -t nat -A POSTROUTING -m owner --uid-owner #{user} -p tcp -j SNAT --to-source #{dest_ip}:#{users[user]}-#{users[user]+ports_per_user-1}" if DEBUG
+end
+
+# Write the XML file to be pushed to the firewall.  I have two
+# misgivings about this.  First, we never tell the firewall the
+# address of where the user's traffic is coming from.  It's possible
+# that it assumes it's coming from the same address that supplies this
+# data via the API, but I seriously doubt it.  Second, we never tell
+# the firewall what the end of the per-user port range is, only the
+# beginning.  Is there an implicit assumption on size?  I seriously
+# doubt that, as well.  But I can't find docs on any of this.
+File.open('add.xml','w') do |file|
+  puts "<uid-message>\n  <payload>\n    <login>" if DEBUG
+  file.puts "<uid-message>\n  <payload>\n    <login>"
+  users.each_key do |user|
+    puts "      <entry user=\"#{user}\" ip=\"#{dest_ip}\" blockstart=\"#{users[user]}\" \>" if DEBUG
+    file.puts "      <entry user=\"#{user}\" ip=\"#{dest_ip}\" blockstart=\"#{users[user]}\" \>"
+  end
+  puts"    </login>\n  </payload>\n  <type>update</type>\n  <version>1.0</version>\n</uid-message>" if DEBUG
+  file.puts"    </login>\n  </payload>\n  <type>update</type>\n  <version>1.0</version>\n</uid-message>"
+end
+
+# Push the data to the firewall.
+cmd='type=user-id&action=set&file-name=add.xml'
+fwfetch(cmd,fw,key)
